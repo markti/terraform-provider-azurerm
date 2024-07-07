@@ -20,6 +20,7 @@ import (
 	"github.com/hashicorp/terraform-provider-azurerm/internal/resourceproviders"
 	"github.com/hashicorp/terraform-provider-azurerm/internal/sdk"
 	"github.com/hashicorp/terraform-provider-azurerm/utils"
+	"github.com/hashicorp/terraform-plugin-framework/function"
 )
 
 func AzureProvider() *schema.Provider {

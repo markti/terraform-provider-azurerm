@@ -5,10 +5,9 @@ package provider
 
 import (
 	"context"
-	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/function"
-	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-provider-azurerm/helpers/azure"
 )
 
 var _ function.Function = &ParseResourceIdentifierFunction{}
@@ -25,7 +24,7 @@ func (f *ParseResourceIdentifierFunction) Metadata(ctx context.Context, req func
 
 func (f *ParseResourceIdentifierFunction) Definition(ctx context.Context, req function.DefinitionRequest, resp *function.DefinitionResponse) {
 	resp.Definition = function.Definition{
-		Summary:     "Parses an Azure Resource Identifier (ID) into its constituent parts",
+		Summary:     "parse_resource_id Function",
 		Description: "Given an Azure Resource Identifier (ID) string, will an object containing the parts of Azure Resource ID. ",
 
 		Parameters: []function.Parameter{
@@ -34,7 +33,9 @@ func (f *ParseResourceIdentifierFunction) Definition(ctx context.Context, req fu
 				Description: "Azure Resource Identifier (ID) to parse",
 			},
 		},
-		Return: function.DynamicReturn{},
+		Return: function.ObjectReturn{
+			AttributeTypes: *azure.ResourceID,
+		},
 	}
 }
 
@@ -52,44 +53,10 @@ func (f *ParseResourceIdentifierFunction) Run(ctx context.Context, req function.
 	}
 
 	// Initialize the response object
-	result := map[string]types.String{
-		"SubscriptionId":       types.StringNull(),
-		"ResourceGroupName":    types.StringNull(),
-		"ResourceName":         types.StringNull(),
-		"ResourceProviderName": types.StringNull(),
-	}
-
-	// Parse the resource ID
-	parts := strings.Split(resourceId, "/")
-
-	var subResources []map[string]types.String
-
-	for i := 0; i < len(parts); i++ {
-		switch parts[i] {
-		case "subscriptions":
-			if i+1 < len(parts) {
-				result["SubscriptionId"] = types.StringValue(parts[i+1])
-			}
-		case "resourceGroups":
-			if i+1 < len(parts) {
-				result["ResourceGroupName"] = types.StringValue(parts[i+1])
-			}
-		case "providers":
-			if i+1 < len(parts) {
-				result["ResourceProviderName"] = types.StringValue(parts[i+1])
-			}
-		default:
-			if i > 0 && parts[i-1] == "providers" {
-				if i+1 < len(parts) {
-					result["ResourceName"] = types.StringValue(parts[i+1])
-				}
-			} else if i > 0 && (parts[i-1] != "subscriptions" && parts[i-1] != "resourceGroups" && parts[i-1] != "providers") {
-				// Capture sub-resource type and name
-				if i+1 < len(parts) {
-					subResources = append(subResources, map[string]types.String{"Type": types.StringValue(parts[i]), "Name": types.StringValue(parts[i+1])})
-				}
-			}
-		}
+	result, err := azure.ParseAzureResourceID(resourceId)
+	if err != nil {
+		resp.Error = err
+		return
 	}
 
 	// Convert sub-resources to types.ListType
