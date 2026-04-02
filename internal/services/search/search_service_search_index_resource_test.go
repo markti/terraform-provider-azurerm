@@ -5,14 +5,13 @@ package search_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
 	"github.com/hashicorp/go-azure-helpers/lang/pointer"
 	"github.com/hashicorp/go-azure-helpers/lang/response"
 	"github.com/hashicorp/go-azure-sdk/data-plane/search/2025-09-01/indexes"
-	"github.com/hashicorp/go-azure-sdk/resource-manager/search/2025-05-01/adminkeys"
-	"github.com/hashicorp/go-azure-sdk/resource-manager/search/2025-05-01/services"
 	"github.com/hashicorp/terraform-provider-azurerm/internal/acceptance"
 	"github.com/hashicorp/terraform-provider-azurerm/internal/acceptance/check"
 	"github.com/hashicorp/terraform-provider-azurerm/internal/clients"
@@ -106,49 +105,21 @@ func (r SearchIndexResource) Exists(ctx context.Context, clients *clients.Client
 		return nil, err
 	}
 
-	// Get the search service
-	servicesClient := clients.Search.ServicesClient
-	searchService, err := servicesClient.Get(ctx, id.SearchServiceId, services.DefaultGetOperationOptions())
-	if err != nil {
-		return nil, fmt.Errorf("retrieving %s: %+v", id.SearchServiceId, err)
+	// Get the endpoint
+	domainSuffix, ok := clients.Account.Environment.Search.DomainSuffix()
+	if !ok {
+		return nil, errors.New("could not determine Search domain suffix for the current environment")
 	}
+	endpoint := fmt.Sprintf("https://%s.%s", id.SearchServiceId.SearchServiceName, *domainSuffix)
 
-	if searchService.Model == nil || searchService.Model.Name == nil {
-		return nil, fmt.Errorf("retrieving %s: model was nil", id.SearchServiceId)
-	}
+	// Use the pre-configured data plane client
+	client := clients.Search.SearchDataPlaneClient.Indexes.Clone(endpoint)
 
-	// Parse the search service ID for the adminkeys package
-	adminKeysId, err := adminkeys.ParseSearchServiceID(id.SearchServiceId.ID())
-	if err != nil {
-		return nil, fmt.Errorf("parsing search service ID for admin keys: %+v", err)
-	}
-
-	// Get admin keys
-	adminKeysClient := clients.Search.AdminKeysClient
-	keysResp, err := adminKeysClient.Get(ctx, *adminKeysId, adminkeys.DefaultGetOperationOptions())
-	if err != nil {
-		return nil, fmt.Errorf("retrieving admin keys for %s: %+v", id.SearchServiceId, err)
-	}
-
-	if keysResp.Model == nil || keysResp.Model.PrimaryKey == nil {
-		return nil, fmt.Errorf("retrieving admin keys: response was nil")
-	}
-
-	// Create data plane client
-	endpoint := fmt.Sprintf("https://%s.search.windows.net", *searchService.Model.Name)
-	indexClient, err := indexes.NewIndexesClientWithBaseURI(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("creating indexes client: %+v", err)
-	}
-
-	// Configure authentication with admin key
-	// TODO: Check the actual auth mechanism in the SDK
+	// Check if the index exists
 	indexId := indexes.IndexId{
 		IndexName: id.IndexName,
 	}
-
-	// Check if the index exists
-	resp, err := indexClient.Get(ctx, indexId, indexes.DefaultGetOperationOptions())
+	resp, err := client.Get(ctx, indexId, indexes.DefaultGetOperationOptions())
 	if err != nil {
 		if response.WasNotFound(resp.HttpResponse) {
 			return pointer.To(false), nil

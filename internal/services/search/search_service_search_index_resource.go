@@ -2,9 +2,12 @@ package search
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/hashicorp/go-azure-helpers/lang/pointer"
+	"github.com/hashicorp/go-azure-helpers/lang/response"
 	"github.com/hashicorp/go-azure-sdk/data-plane/search/2025-09-01/indexes"
 	"github.com/hashicorp/go-azure-sdk/resource-manager/search/2025-05-01/services"
 	"github.com/hashicorp/terraform-provider-azurerm/internal/sdk"
@@ -13,53 +16,40 @@ import (
 	"github.com/hashicorp/terraform-provider-azurerm/internal/tf/validation"
 )
 
-var _ indexes.SearchIndex
-
 type SearchIndexResource struct{}
 
 var _ sdk.ResourceWithUpdate = SearchIndexResource{}
+var _ indexes.SearchIndex // Keep the import
 
 type SearchIndexModel struct {
-	Name                  string                `tfschema:"name"`
-	SearchServiceId       string                `tfschema:"search_service_id"`
-	Fields                []SearchIndexField    `tfschema:"fields"`
-	Analyzers             []SearchIndexAnalyzer `tfschema:"analyzer"`
-	CorsOptions           []CorsOptions         `tfschema:"cors_options"`
-	ScoringProfiles       []ScoringProfile      `tfschema:"scoring_profile"`
-	DefaultScoringProfile string                `tfschema:"default_scoring_profile"`
-	ETag                  string                `tfschema:"etag"`
+	Name                  string             `tfschema:"name"`
+	SearchServiceId       string             `tfschema:"search_service_id"`
+	Fields                []SearchIndexField `tfschema:"fields"`
+	CorsOptions           []CorsOptions      `tfschema:"cors_options"`
+	DefaultScoringProfile string             `tfschema:"default_scoring_profile"`
+	ETag                  string             `tfschema:"etag"`
 }
 
 type SearchIndexField struct {
-	Name           string             `tfschema:"name"`
-	Type           string             `tfschema:"type"`
-	Key            bool               `tfschema:"key"`
-	Searchable     bool               `tfschema:"searchable"`
-	Filterable     bool               `tfschema:"filterable"`
-	Sortable       bool               `tfschema:"sortable"`
-	Facetable      bool               `tfschema:"facetable"`
-	Retrievable    bool               `tfschema:"retrievable"`
-	Analyzer       string             `tfschema:"analyzer"`
-	SearchAnalyzer string             `tfschema:"search_analyzer"`
-	IndexAnalyzer  string             `tfschema:"index_analyzer"`
-	SynonymMaps    []string           `tfschema:"synonym_maps"`
-	Fields         []SearchIndexField `tfschema:"fields"` // For complex types
-}
-
-type SearchIndexAnalyzer struct {
-	Name      string `tfschema:"name"`
-	Type      string `tfschema:"type"`
-	Tokenizer string `tfschema:"tokenizer"`
+	Name           string   `tfschema:"name"`
+	Type           string   `tfschema:"type"`
+	Key            bool     `tfschema:"key"`
+	Searchable     bool     `tfschema:"searchable"`
+	Filterable     bool     `tfschema:"filterable"`
+	Sortable       bool     `tfschema:"sortable"`
+	Facetable      bool     `tfschema:"facetable"`
+	Retrievable    bool     `tfschema:"retrievable"`
+	Analyzer       string   `tfschema:"analyzer"`
+	SearchAnalyzer string   `tfschema:"search_analyzer"`
+	IndexAnalyzer  string   `tfschema:"index_analyzer"`
+	SynonymMaps    []string `tfschema:"synonym_maps"`
+	// Remove recursive Fields to avoid memory leaks
+	// Complex types should be defined separately if needed
 }
 
 type CorsOptions struct {
 	AllowedOrigins  []string `tfschema:"allowed_origins"`
 	MaxAgeInSeconds int64    `tfschema:"max_age_in_seconds"`
-}
-
-type ScoringProfile struct {
-	Name string `tfschema:"name"`
-	// Add other scoring profile fields as needed
 }
 
 func (r SearchIndexResource) Arguments() map[string]*pluginsdk.Schema {
@@ -111,7 +101,6 @@ func (r SearchIndexResource) Arguments() map[string]*pluginsdk.Schema {
 							"Collection(Edm.Boolean)",
 							"Collection(Edm.DateTimeOffset)",
 							"Collection(Edm.GeographyPoint)",
-							"Edm.ComplexType",
 						}, false),
 					},
 
@@ -187,16 +176,6 @@ func (r SearchIndexResource) Arguments() map[string]*pluginsdk.Schema {
 							ValidateFunc: validation.StringIsNotEmpty,
 						},
 					},
-
-					"fields": {
-						Type:        pluginsdk.TypeList,
-						Optional:    true,
-						Description: "Nested fields for complex types.",
-						Elem:        &pluginsdk.Resource{
-							// Recursive schema - same as parent fields
-							// You would need to define this recursively or limit depth
-						},
-					},
 				},
 			},
 		},
@@ -256,9 +235,7 @@ func (r SearchIndexResource) ResourceType() string {
 }
 
 func (r SearchIndexResource) IDValidationFunc() pluginsdk.SchemaValidateFunc {
-	// You'll need to create a custom ID parser for data plane resources
-	// Since data plane doesn't use ARM resource IDs
-	return validation.StringIsNotEmpty
+	return parse.ValidateSearchIndexID
 }
 
 func (r SearchIndexResource) Create() sdk.ResourceFunc {
@@ -276,54 +253,50 @@ func (r SearchIndexResource) Create() sdk.ResourceFunc {
 				return fmt.Errorf("parsing search service ID: %+v", err)
 			}
 
-			// Get the search service to retrieve endpoint and keys
-			client := metadata.Client.Search.ServicesClient
-			searchService, err := client.Get(ctx, *searchServiceId, services.DefaultGetOperationOptions())
+			// Get the endpoint from the environment
+			domainSuffix, ok := metadata.Client.Account.Environment.Search.DomainSuffix()
+			if !ok {
+				return errors.New("could not determine Search domain suffix for the current environment")
+			}
+			endpoint := fmt.Sprintf("https://%s.%s", searchServiceId.SearchServiceName, *domainSuffix)
+
+			// Use the pre-configured data plane client
+			client := metadata.Client.Search.SearchDataPlaneClient.Indexes.Clone(endpoint)
+
+			// Check if index already exists
+			indexId := indexes.IndexId{
+				IndexName: model.Name,
+			}
+			existing, err := client.Get(ctx, indexId, indexes.DefaultGetOperationOptions())
 			if err != nil {
-				return fmt.Errorf("retrieving %s: %+v", searchServiceId, err)
+				if !response.WasNotFound(existing.HttpResponse) {
+					return fmt.Errorf("checking for existing index %q: %+v", model.Name, err)
+				}
+			}
+			if !response.WasNotFound(existing.HttpResponse) {
+				return metadata.ResourceRequiresImport(r.ResourceType(), parse.NewSearchIndexID(*searchServiceId, model.Name))
 			}
 
-			if searchService.Model == nil {
-				return fmt.Errorf("retrieving %s: model was nil", searchServiceId)
+			// Build index definition
+			indexDef := indexes.SearchIndex{
+				Name:   model.Name,
+				Fields: expandSearchIndexFields(model.Fields),
 			}
 
-			// TODO: Create data plane client using the endpoint
-			// You'll need to:
-			// 1. Get admin keys using client.ListAdminKeys(ctx, *searchServiceId)
-			// 2. Construct the data plane endpoint: https://{serviceName}.search.windows.net
-			// 3. Create an Azure AI Search data plane client
-			// 4. Build the index schema from model.Fields
-			// 5. Call the CreateOrUpdateIndex API
+			if len(model.CorsOptions) > 0 {
+				indexDef.CorsOptions = expandCorsOptions(model.CorsOptions)
+			}
 
-			// Example (you'll need to adapt based on the actual SDK):
-			/*
-			   keysResp, err := client.ListAdminKeys(ctx, *searchServiceId)
-			   if err != nil {
-			       return fmt.Errorf("retrieving admin keys: %+v", err)
-			   }
+			if model.DefaultScoringProfile != "" {
+				indexDef.DefaultScoringProfile = &model.DefaultScoringProfile
+			}
 
-			   endpoint := fmt.Sprintf("https://%s.search.windows.net", searchServiceId.SearchServiceName)
+			// Create the index
+			if _, err := client.CreateOrUpdate(ctx, indexId, indexDef, indexes.DefaultCreateOrUpdateOperationOptions()); err != nil {
+				return fmt.Errorf("creating search index %q: %+v", model.Name, err)
+			}
 
-			   // Create data plane client with endpoint and key
-			   dataPlaneClient, err := azsearch.NewIndexClient(endpoint, keysResp.Model.PrimaryKey, nil)
-			   if err != nil {
-			       return fmt.Errorf("creating data plane client: %+v", err)
-			   }
-
-			   // Build index definition
-			   index := azsearch.Index{
-			       Name:   pointer.To(model.Name),
-			       Fields: expandSearchIndexFields(model.Fields),
-			       // ... other properties
-			   }
-
-			   // Create the index
-			   if _, err := dataPlaneClient.CreateOrUpdate(ctx, model.Name, index, nil); err != nil {
-			       return fmt.Errorf("creating search index %q: %+v", model.Name, err)
-			   }
-			*/
-
-			// Set the resource ID (custom format for data plane)
+			// Set the resource ID
 			id := parse.NewSearchIndexID(*searchServiceId, model.Name)
 			metadata.SetID(id)
 
@@ -336,13 +309,53 @@ func (r SearchIndexResource) Read() sdk.ResourceFunc {
 	return sdk.ResourceFunc{
 		Timeout: 5 * time.Minute,
 		Func: func(ctx context.Context, metadata sdk.ResourceMetaData) error {
-			// Parse custom ID
-			// Get data plane client
-			// Call Get Index API
-			// Flatten response into model
-			// Set state
+			id, err := parse.SearchIndexID(metadata.ResourceData.Id())
+			if err != nil {
+				return err
+			}
 
-			return nil
+			// Get the endpoint
+			domainSuffix, ok := metadata.Client.Account.Environment.Search.DomainSuffix()
+			if !ok {
+				return errors.New("could not determine Search domain suffix for the current environment")
+			}
+			endpoint := fmt.Sprintf("https://%s.%s", id.SearchServiceId.SearchServiceName, *domainSuffix)
+
+			// Use the pre-configured data plane client
+			client := metadata.Client.Search.SearchDataPlaneClient.Indexes.Clone(endpoint)
+
+			// Get the index
+			indexId := indexes.IndexId{
+				IndexName: id.IndexName,
+			}
+			resp, err := client.Get(ctx, indexId, indexes.DefaultGetOperationOptions())
+			if err != nil {
+				if response.WasNotFound(resp.HttpResponse) {
+					return metadata.MarkAsGone(id)
+				}
+				return fmt.Errorf("retrieving search index %q: %+v", id.IndexName, err)
+			}
+
+			if resp.Model == nil {
+				return fmt.Errorf("retrieving search index %q: model was nil", id.IndexName)
+			}
+
+			// Flatten into state
+			state := SearchIndexModel{
+				Name:            resp.Model.Name,
+				SearchServiceId: id.SearchServiceId.ID(),
+				Fields:          flattenSearchIndexFields(resp.Model.Fields),
+			}
+
+			if resp.Model.CorsOptions != nil {
+				state.CorsOptions = flattenCorsOptions(resp.Model.CorsOptions)
+			}
+
+			if resp.Model.DefaultScoringProfile != nil {
+				state.DefaultScoringProfile = pointer.From(resp.Model.DefaultScoringProfile)
+			}
+
+			return metadata.Encode(&state)
 		},
 	}
 }
@@ -351,7 +364,48 @@ func (r SearchIndexResource) Update() sdk.ResourceFunc {
 	return sdk.ResourceFunc{
 		Timeout: 30 * time.Minute,
 		Func: func(ctx context.Context, metadata sdk.ResourceMetaData) error {
-			// Similar to Create, but handle updates
+			id, err := parse.SearchIndexID(metadata.ResourceData.Id())
+			if err != nil {
+				return err
+			}
+
+			var model SearchIndexModel
+			if err := metadata.Decode(&model); err != nil {
+				return fmt.Errorf("decoding: %+v", err)
+			}
+
+			// Get the endpoint
+			domainSuffix, ok := metadata.Client.Account.Environment.Search.DomainSuffix()
+			if !ok {
+				return errors.New("could not determine Search domain suffix for the current environment")
+			}
+			endpoint := fmt.Sprintf("https://%s.%s", id.SearchServiceId.SearchServiceName, *domainSuffix)
+
+			// Use the pre-configured data plane client
+			client := metadata.Client.Search.SearchDataPlaneClient.Indexes.Clone(endpoint)
+
+			// Build updated index
+			indexDef := indexes.SearchIndex{
+				Name:   model.Name,
+				Fields: expandSearchIndexFields(model.Fields),
+			}
+
+			if len(model.CorsOptions) > 0 {
+				indexDef.CorsOptions = expandCorsOptions(model.CorsOptions)
+			}
+
+			if model.DefaultScoringProfile != "" {
+				indexDef.DefaultScoringProfile = &model.DefaultScoringProfile
+			}
+
+			// Update the index
+			indexId := indexes.IndexId{
+				IndexName: id.IndexName,
+			}
+			if _, err := client.CreateOrUpdate(ctx, indexId, indexDef, indexes.DefaultCreateOrUpdateOperationOptions()); err != nil {
+				return fmt.Errorf("updating search index %q: %+v", id.IndexName, err)
+			}
+
 			return nil
 		},
 	}
@@ -361,20 +415,145 @@ func (r SearchIndexResource) Delete() sdk.ResourceFunc {
 	return sdk.ResourceFunc{
 		Timeout: 30 * time.Minute,
 		Func: func(ctx context.Context, metadata sdk.ResourceMetaData) error {
-			// Get data plane client
-			// Call Delete Index API
+			id, err := parse.SearchIndexID(metadata.ResourceData.Id())
+			if err != nil {
+				return err
+			}
+
+			// Get the endpoint
+			domainSuffix, ok := metadata.Client.Account.Environment.Search.DomainSuffix()
+			if !ok {
+				return errors.New("could not determine Search domain suffix for the current environment")
+			}
+			endpoint := fmt.Sprintf("https://%s.%s", id.SearchServiceId.SearchServiceName, *domainSuffix)
+
+			// Use the pre-configured data plane client
+			client := metadata.Client.Search.SearchDataPlaneClient.Indexes.Clone(endpoint)
+
+			// Delete the index
+			indexId := indexes.IndexId{
+				IndexName: id.IndexName,
+			}
+			if _, err := client.Delete(ctx, indexId, indexes.DefaultDeleteOperationOptions()); err != nil {
+				return fmt.Errorf("deleting search index %q: %+v", id.IndexName, err)
+			}
+
 			return nil
 		},
 	}
 }
 
-// Helper functions for expand/flatten
-func expandSearchIndexFields(input []SearchIndexField) []interface{} {
-	// Convert Terraform model to SDK model
-	return nil
+// Helper functions
+func expandSearchIndexFields(input []SearchIndexField) []indexes.SearchField {
+	if len(input) == 0 {
+		return nil
+	}
+
+	results := make([]indexes.SearchField, 0, len(input))
+	for _, v := range input {
+		field := indexes.SearchField{
+			Name: v.Name,
+			Type: indexes.SearchFieldDataType(v.Type),
+		}
+
+		if v.Key {
+			field.Key = pointer.To(true)
+		}
+		if v.Searchable {
+			field.Searchable = pointer.To(true)
+		}
+		if v.Filterable {
+			field.Filterable = pointer.To(true)
+		}
+		if v.Sortable {
+			field.Sortable = pointer.To(true)
+		}
+		if v.Facetable {
+			field.Facetable = pointer.To(true)
+		}
+		if v.Retrievable {
+			field.Retrievable = pointer.To(true)
+		}
+		if v.Analyzer != "" {
+			analyzer := indexes.LexicalAnalyzerName(v.Analyzer)
+			field.Analyzer = &analyzer
+		}
+		if v.SearchAnalyzer != "" {
+			searchAnalyzer := indexes.LexicalAnalyzerName(v.SearchAnalyzer)
+			field.SearchAnalyzer = &searchAnalyzer
+		}
+		if v.IndexAnalyzer != "" {
+			indexAnalyzer := indexes.LexicalAnalyzerName(v.IndexAnalyzer)
+			field.IndexAnalyzer = &indexAnalyzer
+		}
+		if len(v.SynonymMaps) > 0 {
+			field.SynonymMaps = &v.SynonymMaps
+		}
+
+		results = append(results, field)
+	}
+
+	return results // Changed from &results
 }
 
-func flattenSearchIndexFields(input []interface{}) []SearchIndexField {
-	// Convert SDK model to Terraform model
-	return nil
+func expandCorsOptions(input []CorsOptions) *indexes.CorsOptions {
+	if len(input) == 0 {
+		return nil
+	}
+
+	cors := input[0]
+	return &indexes.CorsOptions{
+		AllowedOrigins:  cors.AllowedOrigins, // Changed from &cors.AllowedOrigins
+		MaxAgeInSeconds: pointer.To(cors.MaxAgeInSeconds),
+	}
+}
+
+func flattenSearchIndexFields(input []indexes.SearchField) []SearchIndexField {
+	if len(input) == 0 { // Changed from input == nil || len(*input) == 0
+		return []SearchIndexField{}
+	}
+
+	results := make([]SearchIndexField, 0, len(input))
+	for _, v := range input {
+		field := SearchIndexField{
+			Name:        v.Name,
+			Type:        string(v.Type),
+			Key:         pointer.From(v.Key),
+			Searchable:  pointer.From(v.Searchable),
+			Filterable:  pointer.From(v.Filterable),
+			Sortable:    pointer.From(v.Sortable),
+			Facetable:   pointer.From(v.Facetable),
+			Retrievable: pointer.From(v.Retrievable),
+		}
+
+		if v.Analyzer != nil {
+			field.Analyzer = string(*v.Analyzer)
+		}
+		if v.SearchAnalyzer != nil {
+			field.SearchAnalyzer = string(*v.SearchAnalyzer)
+		}
+		if v.IndexAnalyzer != nil {
+			field.IndexAnalyzer = string(*v.IndexAnalyzer)
+		}
+		if v.SynonymMaps != nil {
+			field.SynonymMaps = *v.SynonymMaps
+		}
+
+		results = append(results, field)
+	}
+
+	return results
+}
+
+func flattenCorsOptions(input *indexes.CorsOptions) []CorsOptions {
+	if input == nil {
+		return []CorsOptions{}
+	}
+
+	return []CorsOptions{
+		{
+			AllowedOrigins:  input.AllowedOrigins, // Changed from pointer.From(input.AllowedOrigins)
+			MaxAgeInSeconds: pointer.From(input.MaxAgeInSeconds),
+		},
+	}
 }
