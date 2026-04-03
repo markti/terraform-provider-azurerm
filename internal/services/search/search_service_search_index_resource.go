@@ -296,7 +296,7 @@ func (r SearchIndexResource) Create() sdk.ResourceFunc {
 				return fmt.Errorf("creating search index %q: %+v", model.Name, err)
 			}
 
-			// Set the resource ID
+			// Set the resource ID using ARM format (not data plane format)
 			id := parse.NewSearchIndexID(*searchServiceId, model.Name)
 			metadata.SetID(id)
 
@@ -309,9 +309,23 @@ func (r SearchIndexResource) Read() sdk.ResourceFunc {
 	return sdk.ResourceFunc{
 		Timeout: 5 * time.Minute,
 		Func: func(ctx context.Context, metadata sdk.ResourceMetaData) error {
+			// Parse the ARM resource ID
 			id, err := parse.SearchIndexID(metadata.ResourceData.Id())
 			if err != nil {
 				return err
+			}
+
+			// Check whether the parent Search Service still exists via ARM before making the
+			// data-plane call. If the service has been deleted outside of Terraform the DNS
+			// entry is gone and the data-plane call would fail with "no such host" instead of
+			// a 404, which would not be caught by the WasNotFound check below.
+			servicesClient := metadata.Client.Search.ServicesClient
+			serviceResp, err := servicesClient.Get(ctx, id.SearchServiceId, services.DefaultGetOperationOptions())
+			if err != nil {
+				if response.WasNotFound(serviceResp.HttpResponse) {
+					return metadata.MarkAsGone(id)
+				}
+				return fmt.Errorf("checking for existence of %s: %+v", id.SearchServiceId, err)
 			}
 
 			// Get the endpoint
@@ -324,7 +338,7 @@ func (r SearchIndexResource) Read() sdk.ResourceFunc {
 			// Use the pre-configured data plane client
 			client := metadata.Client.Search.SearchDataPlaneClient.Indexes.Clone(endpoint)
 
-			// Get the index
+			// Get the index using data plane ID
 			indexId := indexes.IndexId{
 				IndexName: id.IndexName,
 			}
@@ -333,11 +347,11 @@ func (r SearchIndexResource) Read() sdk.ResourceFunc {
 				if response.WasNotFound(resp.HttpResponse) {
 					return metadata.MarkAsGone(id)
 				}
-				return fmt.Errorf("retrieving search index %q: %+v", id.IndexName, err)
+				return fmt.Errorf("retrieving %s: %+v", id, err)
 			}
 
 			if resp.Model == nil {
-				return fmt.Errorf("retrieving search index %q: model was nil", id.IndexName)
+				return fmt.Errorf("retrieving %s: model was nil", id)
 			}
 
 			// Flatten into state
@@ -364,6 +378,7 @@ func (r SearchIndexResource) Update() sdk.ResourceFunc {
 	return sdk.ResourceFunc{
 		Timeout: 30 * time.Minute,
 		Func: func(ctx context.Context, metadata sdk.ResourceMetaData) error {
+			// Parse the ARM resource ID
 			id, err := parse.SearchIndexID(metadata.ResourceData.Id())
 			if err != nil {
 				return err
@@ -398,7 +413,7 @@ func (r SearchIndexResource) Update() sdk.ResourceFunc {
 				indexDef.DefaultScoringProfile = &model.DefaultScoringProfile
 			}
 
-			// Update the index
+			// Update the index using data plane ID
 			indexId := indexes.IndexId{
 				IndexName: id.IndexName,
 			}
@@ -415,6 +430,7 @@ func (r SearchIndexResource) Delete() sdk.ResourceFunc {
 	return sdk.ResourceFunc{
 		Timeout: 30 * time.Minute,
 		Func: func(ctx context.Context, metadata sdk.ResourceMetaData) error {
+			// Parse the ARM resource ID
 			id, err := parse.SearchIndexID(metadata.ResourceData.Id())
 			if err != nil {
 				return err
@@ -430,7 +446,7 @@ func (r SearchIndexResource) Delete() sdk.ResourceFunc {
 			// Use the pre-configured data plane client
 			client := metadata.Client.Search.SearchDataPlaneClient.Indexes.Clone(endpoint)
 
-			// Delete the index
+			// Delete the index using data plane ID
 			indexId := indexes.IndexId{
 				IndexName: id.IndexName,
 			}
