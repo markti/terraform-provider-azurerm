@@ -27,7 +27,6 @@ type SearchIndexModel struct {
 	Fields                []SearchIndexField `tfschema:"fields"`
 	CorsOptions           []CorsOptions      `tfschema:"cors_options"`
 	DefaultScoringProfile string             `tfschema:"default_scoring_profile"`
-	ETag                  string             `tfschema:"etag"`
 }
 
 type SearchIndexField struct {
@@ -217,13 +216,7 @@ func (r SearchIndexResource) Arguments() map[string]*pluginsdk.Schema {
 }
 
 func (r SearchIndexResource) Attributes() map[string]*pluginsdk.Schema {
-	return map[string]*pluginsdk.Schema{
-		"etag": {
-			Type:        pluginsdk.TypeString,
-			Computed:    true,
-			Description: "The ETag of the search index.",
-		},
-	}
+	return map[string]*pluginsdk.Schema{} // Remove the etag attribute
 }
 
 func (r SearchIndexResource) ModelObject() interface{} {
@@ -292,8 +285,19 @@ func (r SearchIndexResource) Create() sdk.ResourceFunc {
 			}
 
 			// Create the index
-			if _, err := client.CreateOrUpdate(ctx, indexId, indexDef, indexes.DefaultCreateOrUpdateOperationOptions()); err != nil {
-				return fmt.Errorf("creating search index %q: %+v", model.Name, err)
+			resp, err := client.CreateOrUpdate(ctx, indexId, indexDef, indexes.DefaultCreateOrUpdateOperationOptions())
+			if err != nil {
+				// Check if it's actually a success response (200, 201, 204) that the SDK is treating as an error
+				if resp.HttpResponse != nil {
+					statusCode := resp.HttpResponse.StatusCode
+					if statusCode == 200 || statusCode == 201 || statusCode == 204 {
+						// Success - continue
+					} else {
+						return fmt.Errorf("creating search index %q: %+v", model.Name, err)
+					}
+				} else {
+					return fmt.Errorf("creating search index %q: %+v", model.Name, err)
+				}
 			}
 
 			// Set the resource ID using ARM format (not data plane format)
@@ -417,8 +421,20 @@ func (r SearchIndexResource) Update() sdk.ResourceFunc {
 			indexId := indexes.IndexId{
 				IndexName: id.IndexName,
 			}
-			if _, err := client.CreateOrUpdate(ctx, indexId, indexDef, indexes.DefaultCreateOrUpdateOperationOptions()); err != nil {
-				return fmt.Errorf("updating search index %q: %+v", id.IndexName, err)
+			resp, err := client.CreateOrUpdate(ctx, indexId, indexDef, indexes.DefaultCreateOrUpdateOperationOptions())
+			if err != nil {
+				// Check if it's actually a success response (200, 201, 204) that the SDK is treating as an error
+				if resp.HttpResponse != nil {
+					statusCode := resp.HttpResponse.StatusCode
+					if statusCode == 200 || statusCode == 201 || statusCode == 204 {
+						// Success - continue
+						return nil
+					} else {
+						return fmt.Errorf("updating search index %q: %+v", id.IndexName, err)
+					}
+				} else {
+					return fmt.Errorf("updating search index %q: %+v", id.IndexName, err)
+				}
 			}
 
 			return nil
@@ -472,24 +488,14 @@ func expandSearchIndexFields(input []SearchIndexField) []indexes.SearchField {
 			Type: indexes.SearchFieldDataType(v.Type),
 		}
 
-		if v.Key {
-			field.Key = pointer.To(true)
-		}
-		if v.Searchable {
-			field.Searchable = pointer.To(true)
-		}
-		if v.Filterable {
-			field.Filterable = pointer.To(true)
-		}
-		if v.Sortable {
-			field.Sortable = pointer.To(true)
-		}
-		if v.Facetable {
-			field.Facetable = pointer.To(true)
-		}
-		if v.Retrievable {
-			field.Retrievable = pointer.To(true)
-		}
+		// Always set boolean fields explicitly - don't rely on defaults
+		field.Key = pointer.To(v.Key)
+		field.Searchable = pointer.To(v.Searchable)
+		field.Filterable = pointer.To(v.Filterable)
+		field.Sortable = pointer.To(v.Sortable)
+		field.Facetable = pointer.To(v.Facetable)
+		field.Retrievable = pointer.To(v.Retrievable)
+
 		if v.Analyzer != "" {
 			analyzer := indexes.LexicalAnalyzerName(v.Analyzer)
 			field.Analyzer = &analyzer
@@ -509,7 +515,7 @@ func expandSearchIndexFields(input []SearchIndexField) []indexes.SearchField {
 		results = append(results, field)
 	}
 
-	return results // Changed from &results
+	return results
 }
 
 func expandCorsOptions(input []CorsOptions) *indexes.CorsOptions {
@@ -525,21 +531,39 @@ func expandCorsOptions(input []CorsOptions) *indexes.CorsOptions {
 }
 
 func flattenSearchIndexFields(input []indexes.SearchField) []SearchIndexField {
-	if len(input) == 0 { // Changed from input == nil || len(*input) == 0
+	if len(input) == 0 {
 		return []SearchIndexField{}
 	}
 
 	results := make([]SearchIndexField, 0, len(input))
 	for _, v := range input {
 		field := SearchIndexField{
-			Name:        v.Name,
-			Type:        string(v.Type),
-			Key:         pointer.From(v.Key),
-			Searchable:  pointer.From(v.Searchable),
-			Filterable:  pointer.From(v.Filterable),
-			Sortable:    pointer.From(v.Sortable),
-			Facetable:   pointer.From(v.Facetable),
-			Retrievable: pointer.From(v.Retrievable),
+			Name: v.Name,
+			Type: string(v.Type),
+		}
+
+		// Handle nil pointers properly - if nil, use false (the default)
+		// If not nil, use the actual value
+		if v.Key != nil {
+			field.Key = *v.Key
+		}
+		if v.Searchable != nil {
+			field.Searchable = *v.Searchable
+		}
+		if v.Filterable != nil {
+			field.Filterable = *v.Filterable
+		}
+		if v.Sortable != nil {
+			field.Sortable = *v.Sortable
+		}
+		if v.Facetable != nil {
+			field.Facetable = *v.Facetable
+		}
+		if v.Retrievable != nil {
+			field.Retrievable = *v.Retrievable
+		} else {
+			// Retrievable defaults to true if not specified
+			field.Retrievable = true
 		}
 
 		if v.Analyzer != nil {
